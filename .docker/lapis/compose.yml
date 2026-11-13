@@ -1,0 +1,101 @@
+# Lapis: empaquetado local mínimo.
+#
+# Úsalo con el script `scripts/lapis.sh` (up / down / logs / backup / clean / reset).
+#
+# Reglas de limpieza:
+#   - Lo ÚNICO que persiste son 3 volúmenes con nombre: lapis_postgres, lapis_storage, lapis_config.
+#     Nada se escribe dentro del repo.
+#   - Redis es solo caché: vive en RAM (tmpfs), sin snapshots en disco.
+#   - /tmp de los contenedores es tmpfs: los temporales desaparecen al parar.
+#   - Logs con rotación (máx. 2 x 10 MB por contenedor).
+#   - La migración se ejecuta con `run --rm`, así que no deja contenedores parados.
+name: lapis
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '2'
+
+x-server-env: &server-env
+  REDIS_SERVER_HOST: redis
+  DATABASE_URL: postgresql://lapis@postgres:5432/lapis
+  DEPLOYMENT_TYPE: selfhosted
+  AFFINE_SERVER_HOST: localhost
+  AFFINE_SERVER_PORT: '3010'
+
+x-server-volumes: &server-volumes
+  - storage:/root/.affine/storage
+  - config:/root/.affine/config
+
+services:
+  server:
+    image: ${LAPIS_IMAGE:-ghcr.io/toeverything/affine:stable}
+    ports:
+      - '127.0.0.1:${LAPIS_PORT:-3010}:3010'
+    environment: *server-env
+    volumes: *server-volumes
+    tmpfs:
+      - /tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *logging
+    restart: unless-stopped
+
+  # Genera la clave privada (primer arranque) y aplica migraciones.
+  # No arranca con `up`; el script lo lanza con `docker compose run --rm migrate`.
+  migrate:
+    image: ${LAPIS_IMAGE:-ghcr.io/toeverything/affine:stable}
+    profiles: ['tools']
+    command: ['node', './scripts/self-host-predeploy.js']
+    environment: *server-env
+    volumes: *server-volumes
+    tmpfs:
+      - /tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: lapis
+      POSTGRES_DB: lapis
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+      POSTGRES_HOST_AUTH_METHOD: trust # solo accesible dentro de la red de compose (sin puerto publicado)
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'lapis', '-d', 'lapis']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *logging
+    restart: unless-stopped
+
+volumes:
+  postgres:
+    name: lapis_postgres
+  storage:
+    name: lapis_storage
+  config:
+    name: lapis_config
